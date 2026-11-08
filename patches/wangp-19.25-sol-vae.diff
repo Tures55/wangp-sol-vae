@@ -1,0 +1,372 @@
+diff --git a/models/minimax_h3/components/sol_decoder.py b/models/minimax_h3/components/sol_decoder.py
+new file mode 100644
+index 0000000..a94961c
+--- /dev/null
++++ b/models/minimax_h3/components/sol_decoder.py
+@@ -0,0 +1,228 @@
++# Sol-H3-VAE decoder (Comfy-Org minimax_h3_sol_vae_int8_convrot) for WanGP.
++# Plain PyTorch port of ComfyUI's comfy/ldm/minimax/vae.py::NonCausalViT3DDecoder (GPL-3.0, ComfyUI):
++# the H3 ViT decoder pruned to 24 layers and distilled to decode a whole clip at once, with local window attention.
++
++import math
++import os
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++from shared.kernels import ops as kernels, vae_ops
++from ..interrupt import GenerationInterrupted
++from .video_autoencoder import MiniMaxH3VideoTransformerBlock
++
++_FUSED_DTYPES = (torch.float16, torch.bfloat16)
++try:
++    from sageattention import sageattn as _sageattn
++except Exception:
++    _sageattn = None
++
++
++def _rms(x, norm):
++    out = F.rms_norm(x.float(), (x.shape[-1],), None if norm is None else norm.weight.float(), norm.eps if norm is not None else 1e-5)
++    return out.to(x.dtype)
++
++
++class MiniMaxH3SolViTDecoder3d(nn.Module):
++    """16x16-token spatial windows over 5-latent temporal windows (odd layers shifted by half a window), plus 5 global tokens per
++    5-latent block that attend to their whole block and are visible to every window of it. Rope ids are window-local. Tokens live in
++    block-major rows; the layers stream over blocks with a ring of two q / k / v slots, so only the residual stream spans the clip."""
++
++    max_windows = 64
++    ring = 2
++
++    def __init__(self, in_channels=24, out_channels=3, patch_size=16, patch_size_t=4, num_layers=24, num_attention_heads=32,
++                 attention_head_dim=64, num_register_tokens=4, ffn_mult=4, rope_theta=100.0, rope_dim_ratio=0.75, norm_eps=1e-5,
++                 window=16, block=5, time_shift=2, frames_to_trim=3):
++        super().__init__()
++        dim = num_attention_heads * attention_head_dim
++        self.patch_size, self.patch_size_t, self.out_channels = patch_size, patch_size_t, out_channels
++        self.heads, self.dim_head, self.dim = num_attention_heads, attention_head_dim, dim
++        self.window, self.block, self.time_shift, self.frames_to_trim = window, block, time_shift, frames_to_trim
++        self.num_global = num_register_tokens + 1
++        self.x_embedder = nn.Linear(in_channels, dim)
++        self.register_tokens = nn.Parameter(torch.zeros(1, num_register_tokens, dim))
++        self.blocks = nn.ModuleList([MiniMaxH3VideoTransformerBlock(dim=dim, heads=num_attention_heads, dim_head=attention_head_dim,
++                                                                    ffn_mult=ffn_mult, eps=norm_eps) for _ in range(num_layers)])
++        self.norm_out = nn.LayerNorm(dim, eps=norm_eps)
++        self.proj_out = nn.Linear(dim, out_channels * patch_size_t * patch_size * patch_size)
++        rot = int(attention_head_dim * rope_dim_ratio)
++        self.rot_half = rot // 2
++        self.register_buffer("inv_freq", 1.0 / rope_theta ** torch.arange(0, 1, 2 * 3 / rot, dtype=torch.float32), persistent=False)
++        self.progress = None
++
++    def output_frames(self, T):
++        return T * self.patch_size_t - self.frames_to_trim * -(-T // self.block)
++
++    def _build_geometry(self, T, H, W):
++        ws, tb, S, R, HW = self.window, self.block, self.num_global, self.ring, H * W
++        nb = -(-T // tb)
++        starts = [min(b * tb, T) * HW + b * S for b in range(nb + 1)]
++        slot_rows = tb * HW + S
++        t = torch.arange(T)
++        tblk = t // tb
++        row = (torch.tensor(starts)[tblk] + (t - tblk * tb) * HW)[:, None, None] + torch.arange(HW).view(H, W)
++        slot = row + ((tblk % R) * slot_rows - torch.tensor(starts)[tblk])[:, None, None]
++        glob = torch.tensor(starts[1:])[:, None] - S + torch.arange(S)
++        gslot = glob + ((torch.arange(nb) % R) * slot_rows - torch.tensor(starts[:nb]))[:, None]
++        geo = {"rows": list(zip(starts, starts[1:])), "slot_rows": slot_rows, "tok": row.reshape(-1),
++               "glob": glob.reshape(-1), "gslot": gslot, "shifts": []}
++
++        def spans(n, shift, size):
++            edges = ((max(i * size - shift, 0), min((i + 1) * size - shift, n)) for i in range(-(-(n + shift) // size)))
++            return [(lo, hi) for lo, hi in edges if hi > lo]
++
++        for s, st in ((0, 0), (ws // 2, self.time_shift)):
++            axes = [((torch.arange(n) + o) % m + 0.5) / m * 2 - 1 for n, o, m in ((T, st, tb), (H, s, ws), (W, s, ws))]
++            ids = torch.zeros(starts[-1], 3)
++            ids[row.reshape(-1)] = torch.stack(torch.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
++            windows_at, done_at = [[] for _ in range(nb)], [0] * nb
++            for t_lo, t_hi in spans(T, st, tb):
++                blocks = sorted({t_lo // tb, (t_hi - 1) // tb})
++                gk = gslot[blocks].reshape(-1)
++                groups = {}
++                for y_lo, y_hi in spans(H, s, ws):
++                    for x_lo, x_hi in spans(W, s, ws):
++                        qi = slot[t_lo:t_hi, y_lo:y_hi, x_lo:x_hi].reshape(-1)
++                        groups.setdefault(len(qi), []).append((qi, torch.cat([qi, gk])))
++                for wins in groups.values():
++                    for c in range(0, len(wins), self.max_windows):
++                        windows_at[blocks[-1]].append(tuple(torch.stack(t) for t in zip(*wins[c:c + self.max_windows])))
++                for b in blocks:
++                    done_at[b] = max(done_at[b], blocks[-1])
++            blocks_at = [[c for c in range(nb) if done_at[c] == b] for b in range(nb)]
++            geo["shifts"].append({"ids": ids, "windows_at": windows_at, "blocks_at": blocks_at})
++        return geo
++
++    def _rope_tables(self, ids):
++        angles = 2.0 * math.pi * ids[:, :, None].float() * self.inv_freq.to(ids.device)[None, None, :]
++        angles = angles.flatten(1, 2)[:, None, :]  # (rows, 1, rot/2)
++        return angles.cos(), angles.sin()
++
++    def _norm_rope(self, x, cos, sin):
++        """Per-head RMSNorm (no weight) then split-half rope of the first rot channels; x (rows, heads, head_dim)."""
++        x = x.float()
++        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5)
++        h = self.rot_half
++        a, b = x[..., :h], x[..., h:2 * h]
++        a2 = a * cos - b * sin
++        b2 = a * sin + b * cos
++        return torch.cat([a2, b2, x[..., 2 * h:]], dim=-1)
++
++    use_sage = os.environ.get("SOL_SAGE", "1") == "1"
++
++    @classmethod
++    def _sdpa(cls, q, k, v):
++        # (n, L, heads, dh) -> (n, Lq, heads * dh)
++        if cls.use_sage and _sageattn is not None and q.is_cuda and q.dtype in _FUSED_DTYPES:
++            return _sageattn(q.contiguous(), k.contiguous(), v.contiguous(), tensor_layout="NHD").flatten(2)
++        out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
++        return torch.nan_to_num(out.transpose(1, 2).flatten(2))
++
++    def _fused_ok(self, x):
++        blk = self.blocks[0]
++        return (all(kernels.can_linear(layer, x, dtypes=_FUSED_DTYPES) for layer in (blk.attn.to_qkv, blk.attn.to_out, blk.ff.w1, blk.ff.w2))
++                and all(p.device == x.device and p.dtype == x.dtype for p in (blk.norm1.weight, blk.norm2.weight, blk.scale1, blk.scale2)))
++
++    def _rotary(self, ids):
++        # (1, rows, 1, 2 * rot_half) FP32 cos / sin with equal halves, as MiniMaxH3VideoRotaryPosEmbed makes them for the fused kernels
++        angles = (2.0 * math.pi * ids[:, :, None].float() * self.inv_freq.to(ids.device)[None, None, :]).flatten(1, 2)
++        angles = angles.tile(2)[None, :, None, :]
++        return vae_ops.prepare_rotary(angles.cos(), angles.sin())
++
++    chunk_rows = 8192
++
++    def _post_attention_fused(self, blk, out, x):
++        kernels.linear(blk.attn.to_out, [out], residual=x, residual_scale=blk.scale1, out=x)
++        for c in range(0, x.shape[0], self.chunk_rows):
++            xc = x[c:c + self.chunk_rows]
++            expanded = kernels.linear(blk.ff.w1, [xc], input_act="rms_norm", act_weight=blk.norm2.weight, act_eps=blk.norm2.eps)
++            expanded_list, expanded = [expanded], None
++            kernels.linear(blk.ff.w2, expanded_list, input_act="swiglu", residual=xc, residual_scale=blk.scale2, out=xc)
++        return x
++
++    def _post_attention(self, blk, out, x):
++        x.add_(blk.attn.to_out(out) * blk.scale1.to(x))
++        rows = x.shape[0]
++        chunk = 8192
++        for c in range(0, rows, chunk):
++            xc = x[c:c + chunk]
++            xc.add_(blk.ff._project([_rms(xc, blk.norm2)]) * blk.scale2.to(xc))
++        return x
++
++    def forward(self, z, write):
++        """z: (1, C, T, H, W); write(first frame index, pixels (1, out_channels, F, 16H, 16W)) is called once per 5-latent block."""
++        _, C, T, H, W = z.shape
++        heads, dh, D, S, R = self.heads, self.dim_head, self.dim, self.num_global, self.ring
++        dev, dtype = z.device, self.x_embedder.weight.dtype if self.x_embedder.weight.dtype in (torch.float16, torch.bfloat16) else z.dtype
++        geo = self._build_geometry(T, H, W)
++        rows, slot_rows = geo["rows"], geo["slot_rows"]
++        gslot = geo["gslot"].to(dev)
++        shifts = [(sh["ids"].to(dev), [[(qi.to(dev), ki.to(dev)) for qi, ki in wins] for wins in sh["windows_at"]], sh["blocks_at"])
++                  for sh in geo["shifts"]]
++        x = torch.empty(rows[-1][1], D, dtype=dtype, device=dev)
++        x[geo["tok"].to(dev)] = self.x_embedder(z[0].permute(1, 2, 3, 0).reshape(-1, C).to(dtype)).to(dtype)
++        x[geo["glob"].to(dev)] = torch.cat([self.register_tokens[0].to(x), x.new_zeros(1, D)], 0).repeat(len(rows), 1)
++        fused = self._fused_ok(x[:1]) and os.environ.get("SOL_FUSED", "1") == "1"
++        if fused:
++            rotaries = [self._rotary(sh[0]) for sh in shifts]
++            plan = vae_ops.rope_plan(x[None, :1], dh, tuple(t[:, :1] for t in rotaries[0]))
++            fused = plan[0] is not None
++        if not getattr(self, '_path_logged', False):
++            print(f"[Sol VAE] decoder path: {'fused INT8 kernels' if fused else 'PyTorch'}")
++            self._path_logged = True
++        if fused:
++            qkv_ring = torch.empty(R * slot_rows, heads, 3, dh, dtype=dtype, device=dev)
++            q, k, v = qkv_ring.unbind(2)
++        else:
++            q, k, v = (torch.empty(R * slot_rows, heads, dh, dtype=dtype, device=dev) for _ in range(3))
++        attn_out = torch.empty(R * slot_rows, D, dtype=dtype, device=dev)
++        for li, blk in enumerate(self.blocks):
++            if getattr(self, "_interrupt", False):
++                raise GenerationInterrupted
++            attn, (ids, windows_at, blocks_at) = blk.attn, shifts[li % 2]
++            for b, (r0, r1) in enumerate(rows):
++                s0 = (b % R) * slot_rows
++                s1 = s0 + r1 - r0
++                if fused:
++                    # the projection lands in its ring slot (heads, q / k / v, head_dim interleaved): q, k, v are strided views of it
++                    kernels.linear(attn.to_qkv, [x[r0:r1]], input_act="rms_norm", act_weight=blk.norm1.weight, act_eps=blk.norm1.eps,
++                                   out=qkv_ring[s0:s1].view(r1 - r0, 3 * D))
++                    rot = rotaries[li % 2]
++                    qv, kv = vae_ops.finish_rope_(q[None, s0:s1], k[None, s0:s1], tuple(t[:, r0:r1] for t in rot), attn.norm_q.eps, plan)
++                    if qv.data_ptr() != q[s0:s1].data_ptr():
++                        q[s0:s1], k[s0:s1] = qv[0], kv[0]
++                    del qv, kv
++                else:
++                    qkv = attn.to_qkv(_rms(x[r0:r1], blk.norm1)).view(r1 - r0, heads, 3, dh)
++                    cos, sin = self._rope_tables(ids[r0:r1])
++                    q[s0:s1] = self._norm_rope(qkv[:, :, 0], cos, sin).to(dtype)
++                    k[s0:s1] = self._norm_rope(qkv[:, :, 1], cos, sin).to(dtype)
++                    v[s0:s1] = qkv[:, :, 2]
++                    del qkv, cos, sin
++                for qi, ki in windows_at[b]:
++                    attn_out[qi] = self._sdpa(q[qi], k[ki], v[ki]).to(dtype)
++                gs = gslot[b]
++                attn_out[gs] = self._sdpa(q[gs][None], k[s0:s1][None], v[s0:s1][None])[0].to(dtype)
++                for c in blocks_at[b]:
++                    c0, c1 = rows[c]
++                    cs = (c % R) * slot_rows
++                    (self._post_attention_fused if fused else self._post_attention)(blk, attn_out[cs:cs + c1 - c0], x[c0:c1])
++            if self.progress is not None:
++                self.progress.advance()
++        del q, k, v, attn_out, shifts
++        qkv_ring = None
++        rotaries = None
++        f0 = 0
++        p, pt = self.patch_size, self.patch_size_t
++        for r0, r1 in rows:
++            n = (r1 - r0 - S) // (H * W)
++            h = F.layer_norm(x[r0:r1 - S].float(), (D,), self.norm_out.weight.float(), self.norm_out.bias.float(), self.norm_out.eps).to(dtype)
++            y = self.proj_out(h).view(1, n, H, W, self.out_channels, pt, p, p)
++            y = y.permute(0, 4, 1, 5, 2, 6, 3, 7).reshape(1, self.out_channels, n * pt, H * p, W * p)
++            y = y[:, :, self.frames_to_trim:]
++            write(f0, y)
++            f0 += y.shape[2]
++            del h, y
+diff --git a/models/minimax_h3/minimax_h3_handler.py b/models/minimax_h3/minimax_h3_handler.py
+index 6b7bb7f..e4a58b2 100644
+--- a/models/minimax_h3/minimax_h3_handler.py
++++ b/models/minimax_h3/minimax_h3_handler.py
+@@ -21,7 +21,7 @@ from .constants import (H3_AUDIO_REFINEMENT_SETTING, H3_CONTROL_LATENT_CONTINUAT
+                         h3_grouped_masking_enabled)
+ from .dialogue import H3_DIALOGUE_GENERATION, H3_DIALOGUE_MAX_TOTAL_SECONDS, H3_DIALOGUE_PROMPT_INFOS, load_dialogue_whisper
+ from .minimax_h3_main import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
+-                              VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE)
++                              VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE, VIDEO_VAE_SOL_INT8_FILE)
+ from .p_h3_image import (P_H3_IMAGE_ARCHITECTURE, P_H3_IMAGE_FOLDER, P_H3_IMAGE_MAX_IMAGES, P_H3_IMAGE_REPO_ID, P_H3_IMAGE_STEPS, P_H3_IMAGE_SWITCH_THRESHOLD,
+                          P_H3_IMAGE_TEXT_ENCODER_BF16, P_H3_IMAGE_TEXT_ENCODER_FOLDER,
+                          P_H3_IMAGE_TEXT_ENCODER_INT8, P_H3_IMAGE_VAE_FILE, P_H3_IMAGE_VAE_INT8_FILE, query_p_h3_image_def)
+@@ -362,6 +362,7 @@ H3_VIDEO_VAE_INFOS = """Choose the decoder used to turn generated video into fra
+ - **FP8 Mixed Precision:** use the mixed-precision version of the full H3 VAE.
+ - **INT8 ConvRot Decoder:** use the quantized full decoder.
+ - **LightVAE Lite BF16** and **LightVAE Lite INT8 ConvRot:** use a smaller 12-layer decoder. Both keep the original H3 encoder for first/last frames and references. Decoded detail can differ from the full VAE.
++- **Sol VAE INT8 ConvRot (Comfy-Org):** a 24-layer distilled decoder that decodes the whole clip at once with window attention; faster than the full VAE and closer to it than LightVAE. The file `minimax_h3_sol_vae_int8_convrot.safetensors` must already be in `ckpts/minimax_h3` (it is not downloaded).
+ 
+ Selecting **MiniMax H3 VAE** spatial upsampling replaces the selected decoder, including LightVAE, with the X2 decoder.
+ """
+@@ -908,6 +909,7 @@ class family_handler:
+                 "int8_convrot": {"name": "INT8 ConvRot Decoder", "video_vae_file": VIDEO_VAE_INT8_FILE, "x2_vae_file": X2_VAE_INT8_FILE},
+                 "lightvae": {"name": "LightVAE Lite BF16", "video_vae_file": VIDEO_VAE_LIGHT_FILE, "x2_vae_file": X2_VAE_FILE},
+                 "lightvae_int8": {"name": "LightVAE Lite INT8 ConvRot", "video_vae_file": VIDEO_VAE_LIGHT_INT8_FILE, "x2_vae_file": X2_VAE_INT8_FILE},
++                "sol_int8": {"name": "Sol VAE INT8 ConvRot (Comfy-Org)", "video_vae_file": VIDEO_VAE_SOL_INT8_FILE, "x2_vae_file": X2_VAE_INT8_FILE},
+             },
+             "system_configs3": {
+                 "_name": "DiT Denoising Priority",
+@@ -1391,7 +1393,7 @@ class family_handler:
+         video_vae_file = model_def.get("video_vae_file", VIDEO_VAE_FILE)
+         if video_vae_file in (VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE):
+             vae_files.append(video_vae_file)
+-        if video_vae_file in (VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE):
++        if video_vae_file in (VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE):  # the Sol VAE is not on the H3 repository: no download
+             source_folders.append("minimax_h3")
+             file_lists.append([video_vae_file.rsplit("/", 1)[-1]])
+         if "audio_vae_file" not in model_def:
+diff --git a/models/minimax_h3/minimax_h3_main.py b/models/minimax_h3/minimax_h3_main.py
+index 2fa97bc..cfdb6d1 100644
+--- a/models/minimax_h3/minimax_h3_main.py
++++ b/models/minimax_h3/minimax_h3_main.py
+@@ -30,6 +30,7 @@ VIDEO_VAE_FP8MIX_FILE = "minimax_h3_video_vae_fp8mix.safetensors"
+ VIDEO_VAE_INT8_FILE = "minimax_h3/minimax_h3_video_vae_int8_convrot.safetensors"
+ VIDEO_VAE_LIGHT_FILE = "minimax_h3/minimax_h3_lightvae_lite_bf16.safetensors"
+ VIDEO_VAE_LIGHT_INT8_FILE = "minimax_h3/minimax_h3_lightvae_lite_int8_convrot.safetensors"
++VIDEO_VAE_SOL_INT8_FILE = "minimax_h3/minimax_h3_sol_vae_int8_convrot.safetensors"  # Comfy-Org Sol-H3-VAE (Comfy-Org/MiniMax-H3, vae/)
+ VIDEO_VAE_SPLIT_INT8 = True  # comparison switch: the INT8 VAEs split their q / k / v projections too (decoder attention through the attention kit)
+ AUDIO_VAE_FILE = "MiniMax-H3-audio_vae_fp32.safetensors"
+ LATENT_UPSCALER_FOLDER = "minimax_h3"
+@@ -264,12 +265,15 @@ def _load_text_encoder(filename, dtype, distilled=False):
+ 
+ def _load_video_vae(filename, qkv_splitting=True, upsampling=False, single_frame=False):
+     lightvae = filename in (VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE)
++    sol = filename == VIDEO_VAE_SOL_INT8_FILE
++    if sol:
++        qkv_splitting = False  # the Sol decoder reads its fused, head-interleaved to_qkv itself
+     filename = fl.locate_file(filename)
+     dtype = quant_router.load_metadata_state_dict(filename)[0]["encoder.conv_in.weight"].dtype
+     dtype = torch.float16 if dtype == torch.float32 else dtype  # checkpoint-native FP16/BF16; FP32 wastes VRAM for little precision
+     print(f"Loading MiniMax H3 Video VAE '{filename}'...")
+     with init_empty_weights(include_buffers=False):
+-        vae = MiniMaxH3VideoVAE(upsampling=upsampling, decoder_num_layers=12 if lightvae else 36, single_frame=single_frame)
++        vae = MiniMaxH3VideoVAE(upsampling=upsampling, decoder_num_layers=24 if sol else 12 if lightvae else 36, single_frame=single_frame, noncausal_decoder=sol)
+     split_map = get_video_vae_linear_split_map() if qkv_splitting else None
+     if split_map is not None:
+         offload.split_linear_modules(vae, split_map)
+diff --git a/models/minimax_h3/video_vae.py b/models/minimax_h3/video_vae.py
+index 104db0d..b6d07b4 100644
+--- a/models/minimax_h3/video_vae.py
++++ b/models/minimax_h3/video_vae.py
+@@ -21,7 +21,11 @@ import torch.nn.functional as F
+ from shared.utils.phase_progress import vae_encoding_progress
+ from shared.utils.utils import guide_to_float
+ 
++from mmgp import transfer
++from shared.utils.phase_progress import PhaseProgress
++
+ from .components.video_autoencoder import AutoencoderKLMiniMaxH3, get_linear_split_map as get_video_vae_linear_split_map, group_qkv_rows
++from .components.sol_decoder import MiniMaxH3SolViTDecoder3d
+ 
+ 
+ IMAGENET_MEAN = (0.485, 0.456, 0.406)
+@@ -45,9 +49,12 @@ LATENTS_STD = (
+ 
+ 
+ class MiniMaxH3VideoVAE(AutoencoderKLMiniMaxH3):
+-    def __init__(self, upsampling=False, decoder_num_layers=36, single_frame=False):
+-        super().__init__(out_channels=12 if upsampling else 3, decoder_num_layers=decoder_num_layers, decoder_patch_size_t=1 if single_frame else None, latents_mean=LATENTS_MEAN, latents_std=LATENTS_STD)
++    def __init__(self, upsampling=False, decoder_num_layers=36, single_frame=False, noncausal_decoder=False):
++        super().__init__(out_channels=12 if upsampling else 3, decoder_num_layers=1 if noncausal_decoder else decoder_num_layers, decoder_patch_size_t=1 if single_frame else None, latents_mean=LATENTS_MEAN, latents_std=LATENTS_STD)
+         self.upsampling = upsampling
++        self.noncausal = noncausal_decoder
++        if noncausal_decoder:  # Sol-H3-VAE: 24-layer distilled whole-clip decoder with window attention
++            self.decoder = MiniMaxH3SolViTDecoder3d(num_layers=decoder_num_layers)
+         self.register_buffer("_latents_mean", torch.tensor(LATENTS_MEAN, dtype=torch.float32, device="cpu"), persistent=upsampling)
+         self.register_buffer("_latents_std", torch.tensor(LATENTS_STD, dtype=torch.float32, device="cpu"), persistent=upsampling)
+         self.register_buffer("pixel_mean", torch.tensor(IMAGENET_MEAN, device="cpu").view(1, 3, 1, 1, 1), persistent=False)
+@@ -130,6 +137,39 @@ class MiniMaxH3VideoVAE(AutoencoderKLMiniMaxH3):
+         std = self._latents_std.view(1, -1, 1, 1, 1).to(latents)
+         return super().decode((latents * std + mean).to(self._model_dtype), return_dict=False, uint8_rounding=uint8_rounding)[0]
+ 
++    def _decode(self, z, uint8_rounding=None):
++        if not self.noncausal:
++            return super()._decode(z, uint8_rounding)
++        decoder = self.decoder
++        outputs = []
++        for i in range(z.shape[0]):
++            zi = z[i:i + 1]
++            still = zi.shape[2] == 1
++            if still:  # a lone latent decodes as the first frame of a full block of copies
++                zi = zi.repeat(1, 1, decoder.block, 1, 1)
++            frames = 1 if still else decoder.output_frames(zi.shape[2])
++            state = {"out": None}
++
++            def write(f0, y):
++                if f0 >= frames:
++                    return
++                y = y[:, :, :frames - f0]
++                for start in range(0, y.shape[2], 4):
++                    part = self._prepare_decoded_chunk(y[:, :, start:start + 4], uint8_rounding)
++                    if state["out"] is None:
++                        state["out"] = torch.empty(*part.shape[:2], frames, *part.shape[3:], dtype=part.dtype, device="cpu")
++                    transfer.copy_(state["out"][:, :, f0 + start:f0 + start + part.shape[2]], part)
++                    del part
++
++            with PhaseProgress(len(decoder.blocks), unit="layers") as progress:
++                decoder.progress = progress
++                try:
++                    decoder(self.post_quant_conv(zi), write)
++                finally:
++                    decoder.progress = None
++            outputs.append(state["out"])
++        return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
++
+     def _prepare_decoded_chunk(self, chunk, uint8_rounding=None):
+         if self.upsampling:
+             # Spatial/temporal blending operates on the native packed grid. Shuffle
